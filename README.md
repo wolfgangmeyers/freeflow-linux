@@ -98,6 +98,7 @@ Config file: `~/.config/freeflow-linux/config.toml` (created automatically on fi
 api_key = "gsk_..."          # Groq API key (or use GROQ_API_KEY env var)
 hotkey = "KEY_RIGHTCTRL"     # Right Ctrl — change to KEY_F9 etc. if preferred
 # audio_device = ""          # Leave empty to use system default mic
+transcript_log = true        # Log transcripts to ~/.local/share/freeflow-linux/transcripts/
 ```
 
 To find available hotkey names, run `evtest` and press the key you want.
@@ -129,6 +130,14 @@ Environment=DISPLAY=:0
 [Install]
 WantedBy=default.target
 ```
+
+## Transcript logging
+
+Every dictation is logged to `~/.local/share/freeflow-linux/transcripts/YYYY-MM-DD.md` with
+timestamps, raw transcription, and cleaned output. This is useful for recovering text that was
+dictated without a focused window, or for reviewing what was dictated during the day.
+
+To disable logging, set `transcript_log = false` in your config file.
 
 ## Hotkey compatibility notes
 
