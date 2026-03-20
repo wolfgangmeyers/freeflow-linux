@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -55,12 +56,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path.home() / ".config" / "freeflow-linux" / "config.toml"
+TRANSCRIPT_DIR = Path.home() / ".local" / "share" / "freeflow-linux" / "transcripts"
 
 DEFAULT_CONFIG = """\
 # freeflow-linux configuration
 api_key = ""            # Groq API key (or set GROQ_API_KEY env var)
 hotkey = "KEY_RIGHTCTRL"  # Right Ctrl — change to KEY_F9 etc. if preferred
 # audio_device = ""    # Leave empty to use system default mic
+transcript_log = true   # Log transcripts to ~/.local/share/freeflow-linux/transcripts/
 """
 
 POST_PROCESSING_SYSTEM_PROMPT = """\
@@ -77,6 +80,23 @@ Output rules:
 - If the transcription is empty, return exactly: EMPTY
 - Do not add words, names, or content that are not in the transcription. The context is only for correcting spelling of words already spoken.
 - Do not change the meaning of what was said."""
+
+
+def log_transcript(raw: str, cleaned: str, context: str = ""):
+    """Append a timestamped transcript entry to today's log file."""
+    try:
+        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        log_file = TRANSCRIPT_DIR / f"{now:%Y-%m-%d}.md"
+        entry = f"## {now:%H:%M:%S}\n"
+        if context:
+            entry += f"**Context:** {context}\n"
+        entry += f"**Raw:** {raw}\n"
+        entry += f"**Cleaned:** {cleaned}\n\n"
+        with open(log_file, "a") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"[freeflow] Warning: failed to log transcript: {e}")
 
 
 def load_config() -> dict:
@@ -97,6 +117,7 @@ def load_config() -> dict:
     cfg.setdefault("hotkey", "KEY_RIGHTCTRL")
     cfg.setdefault("audio_device", None)
     cfg.setdefault("api_base_url", "")
+    cfg.setdefault("transcript_log", True)
 
     return cfg
 
@@ -410,6 +431,8 @@ class FreeflowDaemon:
                 return
             print(f"[freeflow] Cleaned: {cleaned!r}")
 
+            if self._cfg.get("transcript_log", True):
+                log_transcript(raw, cleaned, context)
             paste_text(cleaned, self._session)
             print("[freeflow] Pasted.")
 
