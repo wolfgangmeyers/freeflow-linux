@@ -50,11 +50,6 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install evdev  (also needs 'input' group membership)")
 
-try:
-    from groq import Groq
-except ImportError:
-    sys.exit("Missing dependency: pip install groq")
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -64,25 +59,9 @@ CONFIG_PATH = Path.home() / ".config" / "freeflow-linux" / "config.toml"
 DEFAULT_CONFIG = """\
 # freeflow-linux configuration
 transcription_url = ""    # Mac FreeFlow transcription API URL (or set FREEFLOW_TRANSCRIPTION_URL)
-api_key = ""              # Groq API key for post-processing (or set GROQ_API_KEY)
 hotkey = "KEY_RIGHTCTRL"  # Right Ctrl — change to KEY_F9 etc. if preferred
 # audio_device = ""       # Leave empty to use system default mic
 """
-
-POST_PROCESSING_SYSTEM_PROMPT = """\
-You are a dictation post-processor. You receive raw speech-to-text output and return clean text ready to be typed into an application.
-
-Your job:
-- Remove filler words (um, uh, you know, like) unless they carry meaning.
-- Fix spelling, grammar, and punctuation errors.
-- When the transcript already contains a word that is a close misspelling of a name or term from the context or custom vocabulary, correct the spelling. Never insert names or terms from context that the speaker did not say.
-- Preserve the speaker's intent, tone, and meaning exactly.
-
-Output rules:
-- Return ONLY the cleaned transcript text, nothing else.
-- If the transcription is empty, return exactly: EMPTY
-- Do not add words, names, or content that are not in the transcription. The context is only for correcting spelling of words already spoken.
-- Do not change the meaning of what was said."""
 
 
 def load_config() -> dict:
@@ -100,14 +79,9 @@ def load_config() -> dict:
     if env_url:
         cfg["transcription_url"] = env_url
 
-    env_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if env_key:
-        cfg["api_key"] = env_key
-
     cfg.setdefault("hotkey", "KEY_RIGHTCTRL")
     cfg.setdefault("audio_device", None)
     cfg.setdefault("transcription_url", "")
-    cfg.setdefault("api_base_url", "")
 
     return cfg
 
@@ -271,7 +245,7 @@ class AudioRecorder:
 
 
 # ---------------------------------------------------------------------------
-# Transcription API / Groq post-processing
+# Transcription API
 # ---------------------------------------------------------------------------
 
 class TranscriptionApiError(RuntimeError):
@@ -353,53 +327,6 @@ def transcribe(client: MacTranscriptionClient, audio_buf: io.BytesIO) -> str:
     return client.transcribe(audio_buf)
 
 
-def post_process(client: Groq, transcript: str, context: str = "") -> str:
-    user_message = (
-        f"Instructions: Clean up RAW_TRANSCRIPTION and return only the cleaned "
-        f"transcript text without surrounding quotes. Return EMPTY if there should be no result.\n\n"
-        f'CONTEXT: "{context}"\n\n'
-        f'RAW_TRANSCRIPTION: "{transcript}"'
-    )
-
-    response = client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        temperature=0.0,
-        messages=[
-            {"role": "system", "content": POST_PROCESSING_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-    )
-
-    result = response.choices[0].message.content.strip()
-
-    # Strip outer quotes if the LLM wrapped the entire response
-    if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
-        result = result[1:-1].strip()
-
-    if result == "EMPTY":
-        return ""
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Context gathering (best-effort, X11 only)
-# ---------------------------------------------------------------------------
-
-def get_context(session: str) -> str:
-    if session != "x11":
-        return ""
-    try:
-        window_id = subprocess.check_output(
-            ["xdotool", "getactivewindow"], stderr=subprocess.DEVNULL
-        ).decode().strip()
-        title = subprocess.check_output(
-            ["xdotool", "getwindowname", window_id], stderr=subprocess.DEVNULL
-        ).decode().strip()
-        return f"Active window: {title}"
-    except Exception:
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # Device detection
 # ---------------------------------------------------------------------------
@@ -434,10 +361,6 @@ class FreeflowDaemon:
     def __init__(self, cfg: dict):
         self._cfg = cfg
         self._transcription_client = MacTranscriptionClient(cfg["transcription_url"])
-        groq_kwargs = {"api_key": cfg["api_key"]}
-        if cfg.get("api_base_url"):
-            groq_kwargs["base_url"] = cfg["api_base_url"]
-        self._post_process_client = Groq(**groq_kwargs)
         self._recorder = AudioRecorder(device=cfg.get("audio_device") or None)
         self._hotkey_code = resolve_hotkey(cfg["hotkey"])
         self._session = get_session_type()
@@ -478,22 +401,14 @@ class FreeflowDaemon:
         print("[freeflow] Processing...")
         audio_buf = self._recorder.stop_recording()
 
-        context = get_context(self._session)
-
         try:
-            raw = transcribe(self._transcription_client, audio_buf)
-            if not raw:
+            transcript = transcribe(self._transcription_client, audio_buf)
+            if not transcript:
                 print("[freeflow] Empty transcription — nothing to paste")
                 return
-            print(f"[freeflow] Raw transcript: {raw!r}")
+            print(f"[freeflow] Transcript: {transcript!r}")
 
-            cleaned = post_process(self._post_process_client, raw, context)
-            if not cleaned:
-                print("[freeflow] Post-processor returned EMPTY — nothing to paste")
-                return
-            print(f"[freeflow] Cleaned: {cleaned!r}")
-
-            paste_text(cleaned, self._session)
+            paste_text(transcript, self._session)
             print("[freeflow] Pasted.")
 
         except Exception as e:
@@ -539,10 +454,8 @@ def main():
 
     cfg = load_config()
 
-    api_key = cfg.get("api_key", "").strip()
     transcription_url = cfg.get("transcription_url", "").strip()
     print(f"[freeflow] Transcription API URL: {transcription_url or 'NOT SET'}")
-    print(f"[freeflow] Groq post-processing API key: {'set' if api_key else 'NOT SET'}")
     print(f"[freeflow] Hotkey: {cfg['hotkey']}")
     print(f"[freeflow] Config: {CONFIG_PATH}")
 
@@ -572,10 +485,6 @@ def main():
 
     if not transcription_url:
         print("[freeflow] ERROR: No transcription API URL. Set transcription_url or FREEFLOW_TRANSCRIPTION_URL")
-        sys.exit(1)
-
-    if not api_key:
-        print("[freeflow] ERROR: No Groq API key for post-processing. Set api_key or GROQ_API_KEY")
         sys.exit(1)
 
     if not devices:
