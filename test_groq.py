@@ -20,7 +20,7 @@ def main():
         print("ERROR: No Groq API key found. Set api_key in config or GROQ_API_KEY env var.")
         sys.exit(1)
 
-    print(f"Config loaded. API key: {api_key[:8]}...")
+    print("Config loaded. Groq API key: set")
 
     groq_kwargs = {"api_key": api_key}
     if cfg.get("api_base_url"):

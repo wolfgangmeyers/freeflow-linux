@@ -13,11 +13,16 @@ Usage:
 import argparse
 import asyncio
 import io
+import json
+import mimetypes
 import os
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -58,9 +63,10 @@ CONFIG_PATH = Path.home() / ".config" / "freeflow-linux" / "config.toml"
 
 DEFAULT_CONFIG = """\
 # freeflow-linux configuration
-api_key = ""            # Groq API key (or set GROQ_API_KEY env var)
+transcription_url = ""    # Mac FreeFlow transcription API URL (or set FREEFLOW_TRANSCRIPTION_URL)
+api_key = ""              # Groq API key for post-processing (or set GROQ_API_KEY)
 hotkey = "KEY_RIGHTCTRL"  # Right Ctrl — change to KEY_F9 etc. if preferred
-# audio_device = ""    # Leave empty to use system default mic
+# audio_device = ""       # Leave empty to use system default mic
 """
 
 POST_PROCESSING_SYSTEM_PROMPT = """\
@@ -80,22 +86,27 @@ Output rules:
 
 
 def load_config() -> dict:
-    """Load config from file, creating default if missing. Env var overrides api_key."""
+    """Load config from file, creating default if missing. Env vars override config."""
     if not CONFIG_PATH.exists():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(DEFAULT_CONFIG)
         print(f"[freeflow] Created default config at {CONFIG_PATH}")
-        print(f"[freeflow] Set api_key in config or export GROQ_API_KEY")
+        print("[freeflow] Set transcription_url or export FREEFLOW_TRANSCRIPTION_URL")
 
     cfg = toml.loads(CONFIG_PATH.read_text())
 
-    # Env var takes priority
+    # Env vars take priority over config file values.
+    env_url = os.environ.get("FREEFLOW_TRANSCRIPTION_URL", "").strip()
+    if env_url:
+        cfg["transcription_url"] = env_url
+
     env_key = os.environ.get("GROQ_API_KEY", "").strip()
     if env_key:
         cfg["api_key"] = env_key
 
     cfg.setdefault("hotkey", "KEY_RIGHTCTRL")
     cfg.setdefault("audio_device", None)
+    cfg.setdefault("transcription_url", "")
     cfg.setdefault("api_base_url", "")
 
     return cfg
@@ -255,20 +266,91 @@ class AudioRecorder:
         buf = io.BytesIO()
         sf.write(buf, audio, self.SAMPLE_RATE, format="WAV", subtype="PCM_16")
         buf.seek(0)
-        buf.name = "audio.wav"  # Groq SDK may inspect filename for MIME type detection
+        buf.name = "audio.wav"  # Multipart upload filename for MIME type detection
         return buf
 
 
 # ---------------------------------------------------------------------------
-# Groq integration
+# Transcription API / Groq post-processing
 # ---------------------------------------------------------------------------
 
-def transcribe(client: Groq, audio_buf: io.BytesIO) -> str:
-    result = client.audio.transcriptions.create(
-        model="whisper-large-v3",
-        file=audio_buf,
-    )
-    return result.text.strip()
+class TranscriptionApiError(RuntimeError):
+    pass
+
+
+class MacTranscriptionClient:
+    def __init__(self, base_url: str, timeout: int = 120):
+        self._base_url = base_url.strip().rstrip("/")
+        self._timeout = timeout
+
+        if not self._base_url:
+            raise ValueError("Missing FREEFLOW_TRANSCRIPTION_URL or transcription_url config")
+
+    def health(self) -> dict:
+        return self._request("GET", "/health")
+
+    def transcribe(self, audio_buf: io.BytesIO) -> str:
+        audio_buf.seek(0)
+        audio = audio_buf.read()
+        if not audio:
+            return ""
+
+        filename = Path(getattr(audio_buf, "name", "audio.wav")).name or "audio.wav"
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        boundary = f"----freeflow{uuid.uuid4().hex}"
+
+        body = b"".join([
+            f"--{boundary}\r\n".encode("ascii"),
+            (
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+            ).encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+            audio,
+            f"\r\n--{boundary}--\r\n".encode("ascii"),
+        ])
+
+        response = self._request(
+            "POST",
+            "/v1/transcriptions",
+            body=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        text = response.get("text")
+        if text is None:
+            raise TranscriptionApiError("Transcription response did not include text")
+        return str(text).strip()
+
+    def _request(self, method: str, path: str, body: bytes | None = None, headers: dict | None = None) -> dict:
+        request = urllib.request.Request(
+            f"{self._base_url}{path}",
+            data=body,
+            method=method,
+            headers=headers or {},
+        )
+        request.add_header("Accept", "application/json")
+
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                response_body = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", "replace").strip()
+            raise TranscriptionApiError(f"Transcription API {e.code}: {error_body}") from e
+        except urllib.error.URLError as e:
+            raise TranscriptionApiError(f"Transcription API request failed: {e.reason}") from e
+
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as e:
+            raise TranscriptionApiError("Transcription API returned non-JSON response") from e
+
+        if not isinstance(data, dict):
+            raise TranscriptionApiError("Transcription API returned unexpected JSON response")
+        return data
+
+
+def transcribe(client: MacTranscriptionClient, audio_buf: io.BytesIO) -> str:
+    return client.transcribe(audio_buf)
 
 
 def post_process(client: Groq, transcript: str, context: str = "") -> str:
@@ -351,10 +433,11 @@ def resolve_hotkey(hotkey_name: str) -> int:
 class FreeflowDaemon:
     def __init__(self, cfg: dict):
         self._cfg = cfg
+        self._transcription_client = MacTranscriptionClient(cfg["transcription_url"])
         groq_kwargs = {"api_key": cfg["api_key"]}
         if cfg.get("api_base_url"):
             groq_kwargs["base_url"] = cfg["api_base_url"]
-        self._client = Groq(**groq_kwargs)
+        self._post_process_client = Groq(**groq_kwargs)
         self._recorder = AudioRecorder(device=cfg.get("audio_device") or None)
         self._hotkey_code = resolve_hotkey(cfg["hotkey"])
         self._session = get_session_type()
@@ -398,13 +481,13 @@ class FreeflowDaemon:
         context = get_context(self._session)
 
         try:
-            raw = transcribe(self._client, audio_buf)
+            raw = transcribe(self._transcription_client, audio_buf)
             if not raw:
                 print("[freeflow] Empty transcription — nothing to paste")
                 return
             print(f"[freeflow] Raw transcript: {raw!r}")
 
-            cleaned = post_process(self._client, raw, context)
+            cleaned = post_process(self._post_process_client, raw, context)
             if not cleaned:
                 print("[freeflow] Post-processor returned EMPTY — nothing to paste")
                 return
@@ -457,7 +540,9 @@ def main():
     cfg = load_config()
 
     api_key = cfg.get("api_key", "").strip()
-    print(f"[freeflow] Groq API key: {'set (' + api_key[:8] + '...)' if api_key else 'NOT SET'}")
+    transcription_url = cfg.get("transcription_url", "").strip()
+    print(f"[freeflow] Transcription API URL: {transcription_url or 'NOT SET'}")
+    print(f"[freeflow] Groq post-processing API key: {'set' if api_key else 'NOT SET'}")
     print(f"[freeflow] Hotkey: {cfg['hotkey']}")
     print(f"[freeflow] Config: {CONFIG_PATH}")
 
@@ -485,8 +570,12 @@ def main():
         print("[freeflow] Dry-run complete.")
         return
 
+    if not transcription_url:
+        print("[freeflow] ERROR: No transcription API URL. Set transcription_url or FREEFLOW_TRANSCRIPTION_URL")
+        sys.exit(1)
+
     if not api_key:
-        print("[freeflow] ERROR: No Groq API key. Set api_key in config or export GROQ_API_KEY")
+        print("[freeflow] ERROR: No Groq API key for post-processing. Set api_key or GROQ_API_KEY")
         sys.exit(1)
 
     if not devices:

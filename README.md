@@ -1,10 +1,10 @@
 # freeflow-linux
 
-Push-to-talk voice dictation for Linux using Groq Whisper + LLM post-processing.
+Push-to-talk voice dictation for Linux using a Mac-hosted FreeFlow transcription API + LLM post-processing.
 
 A Linux equivalent of [FreeFlow](https://github.com/zachlatta/freeflow) (macOS). Hold a
 configurable hotkey (default: Right Ctrl) to record your voice — the audio is transcribed
-by Groq Whisper and cleaned up by a Groq LLM, then pasted into whatever app you have focused.
+by the FreeFlow transcription API and cleaned up by a Groq LLM, then pasted into whatever app you have focused.
 
 ## How it works
 
@@ -39,7 +39,17 @@ python3 -m venv .venv
 
 ## Setup
 
-### 1. Groq API key
+### 1. Transcription API
+
+Configure the Mac-hosted transcription API with environment variables:
+
+```bash
+export FREEFLOW_TRANSCRIPTION_URL=http://100.115.63.19:8765
+```
+
+The Mac transcription API is unauthenticated on the trusted Tailscale bind. Do not configure authentication or send auth headers.
+
+### 2. Groq API key for cleanup
 
 Get a free API key at [console.groq.com](https://console.groq.com/).
 
@@ -55,7 +65,7 @@ Or export it as an environment variable:
 export GROQ_API_KEY=gsk_...
 ```
 
-### 2. Input group (required for hotkey capture)
+### 3. Input group (required for hotkey capture)
 
 freeflow-linux reads keyboard events directly from `/dev/input` via evdev. This requires
 membership in the `input` group:
@@ -65,7 +75,7 @@ sudo usermod -aG input $USER
 # Log out and back in for the group to take effect
 ```
 
-### 3. GNOME Wayland: ydotool setup
+### 4. GNOME Wayland: ydotool setup
 
 If you use GNOME on Wayland, you need `ydotool` for paste to work:
 
@@ -95,9 +105,10 @@ cd ~/code/freeflow-linux
 Config file: `~/.config/freeflow-linux/config.toml` (created automatically on first run)
 
 ```toml
-api_key = "gsk_..."          # Groq API key (or use GROQ_API_KEY env var)
-hotkey = "KEY_RIGHTCTRL"     # Right Ctrl — change to KEY_F9 etc. if preferred
-# audio_device = ""          # Leave empty to use system default mic
+transcription_url = "http://100.115.63.19:8765"  # Or use FREEFLOW_TRANSCRIPTION_URL
+api_key = "gsk_..."                              # Groq cleanup key, or use GROQ_API_KEY
+hotkey = "KEY_RIGHTCTRL"                         # Right Ctrl — change to KEY_F9 etc. if preferred
+# audio_device = ""                              # Leave empty to use system default mic
 ```
 
 To find available hotkey names, run `evtest` and press the key you want.
@@ -123,6 +134,7 @@ After=graphical-session.target
 ExecStart=/path/to/freeflow-linux/.venv/bin/python /path/to/freeflow-linux/freeflow_linux.py
 Restart=on-failure
 RestartSec=3
+Environment=FREEFLOW_TRANSCRIPTION_URL=http://100.115.63.19:8765
 Environment=XDG_SESSION_TYPE=x11
 Environment=DISPLAY=:0
 
@@ -148,4 +160,4 @@ WantedBy=default.target
 ## Credits
 
 Inspired by [FreeFlow](https://github.com/zachlatta/freeflow) by Zach Latta.
-Uses [Groq](https://groq.com/) for fast Whisper transcription and LLM post-processing.
+Uses the Mac-hosted FreeFlow transcription API for speech-to-text and [Groq](https://groq.com/) for LLM post-processing.
